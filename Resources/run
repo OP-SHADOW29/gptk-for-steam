@@ -1,0 +1,217 @@
+#!/bin/sh
+# GPTK Steam compatibility tool.
+# Steam calls: run <verb> <game exe> [args...]
+# Layout next to this script:
+#   gptk/         Apple's evaluation-environment redist (external/ + wine/)
+#   core          name of the Wine core this GPTK version needs (default: wine)
+#                 GPTK 3 needs Wine 7.7 ("wine"); GPTK 4 needs a GPTK-patched, Proton-based
+#                 Wine 11 ("wine-11-gptk")
+#   prefix        name of this tool's Windows folder inside the game's compatdata (default: pfx,
+#                 the name Steam Cloud uses)
+#   steam-bridge  present when the core can load Valve's Steam bridge (lsteamclient), so games
+#                 that need the Steam client and Steam Cloud saves work as on Windows
+#   files/        this tool's Wine: the core with gptk/ (and the bridge) laid over it
+
+tool="$(cd "$(dirname "$0")" && pwd)"
+tool_name="$(basename "$tool")"
+support="$HOME/Library/Application Support/gptk-steam"
+bridge_src="$support/bridge"
+core_name="$(head -n1 "$tool/core" 2>/dev/null | tr -cd 'A-Za-z0-9._-')"
+[ -n "$core_name" ] || core_name=wine
+core="$support/$core_name"
+files="$tool/files"
+bridge=0
+[ -f "$tool/steam-bridge" ] && [ -f "$bridge_src/steam.exe" ] && bridge=1
+
+verb="$1"
+shift || true
+
+case "$verb" in
+  getcompatpath) printf '%s\n' "$STEAM_COMPAT_DATA_PATH"; exit 0 ;;
+  getnativepath) printf '%s\n' "$1"; exit 0 ;;
+esac
+
+data="${STEAM_COMPAT_DATA_PATH:-$support/prefixes/default}"
+mkdir -p "$data"
+log="$data/gptk-run.log"
+exec >>"$log" 2>&1
+echo "=== $(date) $tool_name core=$core_name bridge=$bridge verb=$verb"
+echo "cmd: $*"
+
+# Safety net: a Wine process that keeps respawning must not use up every process
+# slot on the Mac. Cap this launch at the user's current count plus headroom.
+mine=$(ps -U "$(id -u)" -o pid= 2>/dev/null | wc -l | tr -d ' ')
+[ -n "$mine" ] && ulimit -u $((mine + 400)) 2>/dev/null
+
+# Steam's install-script runner needs a Windows Steam client and crashes under Wine.
+case "$1" in
+  *iscriptevaluator.exe) echo "skipping Steam install script"; exit 0 ;;
+esac
+
+# Launch options arrive as plain arguments (no shell in between), so NAME=value
+# words are environment settings, and a literal %command% is dropped.
+n=$#
+while [ "$n" -gt 0 ]; do
+  a="$1"; shift; n=$((n - 1))
+  case "$a" in
+    %command%) ;;
+    [A-Z_]*=*)
+      name="${a%%=*}"
+      case "$name" in
+        *[!A-Z0-9_]*) set -- "$@" "$a" ;;
+        *) export "$a"; echo "env: $a" ;;
+      esac
+      ;;
+    *) set -- "$@" "$a" ;;
+  esac
+done
+
+# Build this tool's Wine once: clone the core, then lay GPTK (and the Steam bridge) on
+# top, the way Apple's Read Me updates a Wine build. Rebuilt when any part changes.
+gptk_id="$(shasum -a 256 < "$tool/gptk/wine/x86_64-windows/d3d12.dll" | cut -c1-16)"
+bridge_id=none
+[ "$bridge" = 1 ] && bridge_id="$(shasum -a 256 < "$bridge_src/x86_64-unix/lsteamclient.so" | cut -c1-16)"
+want="$core_name-$gptk_id-$bridge_id"
+if [ ! -f "$files/.gptk-stamp" ] || [ "$(cat "$files/.gptk-stamp")" != "$want" ]; then
+  if [ ! -d "$core/bin" ]; then
+    echo "no Wine core at $core"
+    osascript -e "display alert \"GPTK tool\" message \"The Wine core '$core_name' is missing. Open GPTK for Steam to install it.\"" >/dev/null 2>&1
+    exit 1
+  fi
+  echo "building $files from $core + gptk (bridge=$bridge)"
+  rm -rf "$files.new"
+  # APFS clone: shares disk blocks with the core, so each tool costs almost no space.
+  cp -Rc "$core" "$files.new" 2>/dev/null || ditto "$core" "$files.new"
+  rm -rf "$files.new/lib/external"
+  ditto "$tool/gptk/external" "$files.new/lib/external"
+  ditto "$tool/gptk/wine" "$files.new/lib/wine"
+  # Apple's Wine loads libd3dshared itself. Plain Wine doesn't, and GPTK's .so files
+  # look for it next to themselves (@loader_path), so put a copy there.
+  unix="$files.new/lib/wine/x86_64-unix"
+  if ! grep -q libd3dshared "$unix/ntdll.so" 2>/dev/null; then
+    cp -c "$files.new/lib/external/libd3dshared.dylib" "$unix/" 2>/dev/null || cp "$files.new/lib/external/libd3dshared.dylib" "$unix/"
+    ditto "$files.new/lib/external/D3DMetal.framework" "$unix/D3DMetal.framework"
+  fi
+  # The Steam bridge as Wine builtins: a Proton-based Wine loads lsteamclient whenever
+  # a game loads Valve's steamclient, and forwards it to the Mac Steam client.
+  if [ "$bridge" = 1 ]; then
+    cp -c "$bridge_src/x86_64-windows/lsteamclient.dll" "$files.new/lib/wine/x86_64-windows/"
+    [ -d "$files.new/lib/wine/i386-windows" ] && cp -c "$bridge_src/i386-windows/lsteamclient.dll" "$files.new/lib/wine/i386-windows/"
+    cp -c "$bridge_src/x86_64-unix/lsteamclient.so" "$unix/"
+  fi
+  rm -rf "$files"
+  mv "$files.new" "$files"
+  printf '%s\n' "$want" > "$files/.gptk-stamp"
+fi
+
+if [ -x "$files/bin/wine64" ]; then wine="$files/bin/wine64"; else wine="$files/bin/wine"; fi
+wineserver="$files/bin/wineserver"
+
+pfx_name="$(head -n1 "$tool/prefix" 2>/dev/null | tr -cd 'A-Za-z0-9._-')"
+[ -n "$pfx_name" ] || pfx_name=pfx
+export WINEPREFIX="$data/$pfx_name"
+export WINEUSERNAME=steamuser
+export DYLD_FALLBACK_LIBRARY_PATH="$files/lib:/usr/lib"
+export WINEDEBUG="${WINEDEBUG:--all}"
+export WINEESYNC="${WINEESYNC:-1}"
+export WINEMSYNC="${WINEMSYNC:-1}"
+# Builtin GPTK graphics, no menu entries, and no crash debugger (a crashing
+# debugger can start copies of itself without end).
+overrides="dxgi,d3d9,d3d10core,d3d11,d3d12,d3d12core=b;winemenubuilder.exe,winedbg.exe=d"
+[ "$bridge" = 1 ] && overrides="$overrides;steamclient,steamclient64=n;lsteamclient=b"
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}$overrides"
+export WINE_GPTK_LIBD3DSHARED_PATH="$files/lib/external/libd3dshared.dylib"
+export CX_APPLEGPTK_LIBD3DSHARED_PATH="$WINE_GPTK_LIBD3DSHARED_PATH"
+export ROSETTA_ADVERTISE_AVX="${ROSETTA_ADVERTISE_AVX:-1}"
+export MTL_HUD_ENABLED="${MTL_HUD_ENABLED:-0}"
+[ -n "$STEAM_COMPAT_CLIENT_INSTALL_PATH" ] || \
+  export STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS"
+
+if [ ! -f "$WINEPREFIX/system.reg" ]; then
+  echo "creating prefix $WINEPREFIX"
+  "$wine" wineboot --init
+  "$wineserver" -w
+fi
+
+# One-time prefix settings: never auto-start the crash debugger, and send steam://
+# links to the Steam helper like Windows Steam does.
+if [ ! -f "$WINEPREFIX/.gptk-settings-1" ]; then
+  reg="$WINEPREFIX/drive_c/gptk-settings.reg"
+  printf '%s\r\n' 'Windows Registry Editor Version 5.00' '' \
+    '[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\AeDebug]' '"Auto"="0"' '' \
+    '[HKEY_LOCAL_MACHINE\Software\Wow6432Node\Microsoft\Windows NT\CurrentVersion\AeDebug]' '"Auto"="0"' '' \
+    '[HKEY_CURRENT_USER\Software\Wine\WineDbg]' '"ShowCrashDialog"=dword:00000000' '' \
+    '[HKEY_LOCAL_MACHINE\Software\Classes\steam]' '"URL Protocol"=""' '' \
+    '[HKEY_LOCAL_MACHINE\Software\Classes\steam\shell\open\command]' \
+    '@="\"C:\\Program Files (x86)\\Steam\\steam.exe\" \"%1\""' '' > "$reg"
+  "$wine" regedit /S 'C:\gptk-settings.reg' && "$wineserver" -w && touch "$WINEPREFIX/.gptk-settings-1"
+  rm -f "$reg"
+fi
+
+# Steam Cloud writes saves into the old Windows XP folder names; games use the modern
+# ones. Merge what Steam put there, then make the old names links to the modern folders
+# so both always see the same files.
+profile="$WINEPREFIX/drive_c/users/steamuser"
+if [ -d "$profile" ]; then
+  for pair in "Local Settings/Application Data|AppData/Local|../AppData/Local" \
+              "Application Data|AppData/Roaming|AppData/Roaming" \
+              "My Documents|Documents|Documents"; do
+    old="$profile/${pair%%|*}"; rest="${pair#*|}"
+    new="$profile/${rest%%|*}"; target="${rest#*|}"
+    mkdir -p "$new"
+    [ -L "$old" ] && continue
+    if [ -d "$old" ]; then
+      # Steam just synced these from the cloud, so they win over older local copies.
+      ditto "$old" "$new" || continue
+      backup="$WINEPREFIX/.gptk-save-merge/$(date +%Y%m%d-%H%M%S)"
+      mkdir -p "$backup"
+      mv "$old" "$backup/" || continue
+      echo "merged Steam Cloud folder '${pair%%|*}' into '${rest%%|*}'"
+    fi
+    mkdir -p "$(dirname "$old")"
+    ln -s "$target" "$old"
+  done
+fi
+
+# Valve's Windows Steam files go where Windows Steam keeps them; steam.exe is the
+# helper Proton runs games through (it registers the running "Steam" for steam_api).
+if [ "$bridge" = 1 ]; then
+  steam_dir="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
+  mkdir -p "$steam_dir"
+  for f in steamclient64.dll steamclient.dll tier0_s64.dll vstdlib_s64.dll steam.exe; do
+    cmp -s "$bridge_src/$f" "$steam_dir/$f" || cp -c -f "$bridge_src/$f" "$steam_dir/$f" 2>/dev/null || cp -f "$bridge_src/$f" "$steam_dir/$f"
+  done
+fi
+
+# GPTK's MetalFX (DLSS) path needs nvngx + nvapi in system32.
+sys32="$WINEPREFIX/drive_c/windows/system32"
+if [ -f "$files/lib/wine/x86_64-windows/nvngx-on-metalfx.dll" ] && [ -d "$sys32" ]; then
+  cp -f "$files/lib/wine/x86_64-windows/nvngx-on-metalfx.dll" "$sys32/nvngx.dll"
+  cp -f "$files/lib/wine/x86_64-windows/nvapi64.dll" "$sys32/nvapi64.dll"
+fi
+
+# Run from the game's own folder, as Windows would.
+case "$1" in
+  /*) [ -f "$1" ] && cd "$(dirname "$1")" ;;
+esac
+
+case "$verb" in
+  waitforexitandrun|run)
+    [ "$verb" = waitforexitandrun ] && "$wineserver" -w
+    status=0
+    if [ "$bridge" = 1 ]; then
+      echo "launch: $wine steam.exe $*"
+      "$wine" 'C:\Program Files (x86)\Steam\steam.exe' "$@" || status=$?
+    else
+      echo "launch: $wine $*"
+      "$wine" "$@" || status=$?
+    fi
+    "$wineserver" -w
+    echo "exit: $status"
+    exit $status
+    ;;
+  *)
+    echo "unknown verb $verb, running anyway"
+    exec "$wine" "$@"
+    ;;
+esac

@@ -1,0 +1,9 @@
+# Built app and generated icon set
+GPTK for Steam.app/
+*.zip
+AppIcon.iconset/
+
+# Bundled third-party files (too large for git; see README "Building from source")
+Payload/
+
+.DS_Store
