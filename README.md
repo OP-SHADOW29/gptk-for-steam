@@ -4,6 +4,8 @@
 
 Adds Apple's **Game Porting Toolkit (GPTK) 3 and 4** to the Mac Steam client's compatibility menu, so Windows games install and run from Steam itself.
 
+<p align="center"><a href="../../releases/latest/download/GPTK-for-Steam.zip"><b>⬇ Download GPTK for Steam (zip)</b></a></p>
+
 After setup, every game's **Properties ▸ Compatibility** menu offers:
 
 | Option | What it does |
@@ -14,7 +16,7 @@ After setup, every game's **Properties ▸ Compatibility** menu offers:
 
 ## Install
 
-1. Download `GPTK-for-Steam.zip` from [Releases](../../releases) and unzip it.
+1. [Download `GPTK-for-Steam.zip`](../../releases/latest/download/GPTK-for-Steam.zip) (also on the [Releases](../../releases) page under **Assets**) and unzip it.
 2. Open **GPTK for Steam**. The first time, macOS may block it because it isn't notarized: open **System Settings ▸ Privacy & Security** and click **Open Anyway**.
 3. Click **Set Up**. You'll be asked how to turn on Steam Play:
    - **Make a second Steam (recommended):** creates *Steam (GPTK)* in Applications and leaves your Steam unmodified.
